@@ -227,13 +227,17 @@ function SparkCard({
               );
             })()}
             <MetricBar
-              label={spark.kind === "host" ? "GPU" : "Temperature"}
+              label={
+                spark.kind === "host" || (spark.metrics.cpu?.temperature ?? 0) > 0
+                  ? "GPU"
+                  : "Temperature"
+              }
               value={displayTemp}
               max={temperatureUnit === "fahrenheit" ? 212 : 100}
               color={tempBarColor}
               caption={tempLabel}
             />
-            {spark.kind === "host" && (spark.metrics.cpu?.temperature ?? 0) > 0 && (() => {
+            {(spark.metrics.cpu?.temperature ?? 0) > 0 && (() => {
               const cpuRaw = spark.metrics.cpu?.temperature ?? 0;
               const cpuDisplay =
                 temperatureUnit === "fahrenheit" ? celsiusToFahrenheit(cpuRaw) : cpuRaw;
@@ -523,15 +527,49 @@ export function OverviewPage({ sparks, hideOffline = false, temperatureUnit = "c
 
   const onlineCount = visibleSparks.filter((s) => s.online).length;
 
+  // Cross-Spark aggregate: sum live decode/prefill tok/s over every online
+  // Spark with an available LLM backend (workers have no local LLM → excluded).
+  const aggregate = visibleSparks.reduce(
+    (acc, s) => {
+      if (!s.online) return acc;
+      const llmArr = s.metrics.llm;
+      if (!Array.isArray(llmArr)) return acc;
+      for (const l of llmArr) {
+        if (!l?.available) continue;
+        acc.decode += l.generationTps ?? 0;
+        acc.prefill += l.prefillTps ?? 0;
+        acc.count += 1;
+      }
+      return acc;
+    },
+    { decode: 0, prefill: 0, count: 0 }
+  );
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--density-overview-rhythm)" }}>
       <div className="flex flex-wrap items-end justify-between gap-6">
-        <h1
-          className="font-normal leading-tight tracking-tight text-text-strong"
-          style={{ fontSize: "var(--density-overview-title)" }}
-        >
-          Overview
-        </h1>
+        <div className="flex flex-wrap items-end gap-3">
+          <h1
+            className="font-normal leading-tight tracking-tight text-text-strong"
+            style={{ fontSize: "var(--density-overview-title)" }}
+          >
+            Overview
+          </h1>
+          {aggregate.count > 0 && (
+            <span
+              className="flex items-baseline gap-1.5 rounded-md border border-border bg-surface-elevated px-2.5 py-1"
+              title={`Summed across ${aggregate.count} live LLM engine${aggregate.count === 1 ? "" : "s"} on ${visibleSparks.filter((s) => s.online).length} online Spark${visibleSparks.filter((s) => s.online).length === 1 ? "" : "s"} — decode (generation) tok/s, excluding prefill`}
+            >
+              <span className="font-tabular text-[16px] font-bold leading-none text-text-strong">
+                {Math.round(aggregate.decode)}
+              </span>
+              <span className="text-[10px] font-medium uppercase tracking-wide text-muted">
+                tok/s
+              </span>
+              <span className="text-[10px] text-muted">· {Math.round(aggregate.prefill)} prefill</span>
+            </span>
+          )}
+        </div>
         <div className="flex flex-wrap items-end justify-end gap-3">
           {batchMsg && (
             <span className={`text-[11px] ${batchMsg.tone === "ok" ? "text-success" : "text-danger"}`}>
