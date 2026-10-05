@@ -9,6 +9,19 @@ Format: version sections are listed newest first.
 
 ## [Unreleased]
 
+### Added
+- **TensorFold `/health` support** — the `exl3` probe now reads TensorFold's extended `/health`
+  (`requests_running`, `streams.max`, `context_length`) for real slot counts instead of
+  guessing from `busy`, and measures the prefill rate against the engine's own
+  `prefill_seconds_total` delta. Dividing a 400k-token prompt jump by wall time read ~224k tok/s.
+- **TensorFold inference tiles** — KV cache occupancy, prefix-cache hit rate, MTP draft
+  acceptance, TTFT p95, end-to-end latency p95 and the cached/uncached prefill split were left
+  blank on the `exl3` path as "vLLM-histogram specific". TensorFold publishes all of them: the
+  tiles it can satisfy come from `/health` (`pool_tokens`/`pool_free_tokens`,
+  `cached_tokens_total`/`prompt_tokens_total`, `accepted_total`/`drafted_total`) and the
+  histograms only Prometheus `/metrics` carries are read best-effort. The histogram parser is
+  prefix-agnostic now (`_parsePromHistogram`), with `_parseVllmHistogram` kept as an alias.
+
 ---
 
 ## [1.8.6] — 2026-09-01

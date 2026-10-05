@@ -487,6 +487,18 @@ export class LlmProbe {
       if (health) {
         this.backendType = "exl3";
         this._applyExl3Health(health, dtSec);
+        // TensorFold's /metrics carries the histogram tiles (TTFT, request latency)
+        // and the waiting queue that /health has no source for. Best effort: a
+        // missing or non-TensorFold /metrics must not fail the probe.
+        try {
+          const tfMetricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+          if (tfMetricsRes.ok) {
+            const tfTxt = await tfMetricsRes.text();
+            if (tfTxt.includes("tensorfold")) this._applyTensorfoldMetrics(tfTxt);
+          }
+        } catch {
+          /* metrics optional */
+        }
         return this._getSnapshot();
       }
       if (this.backendType === "exl3") this.backendType = "vllm";
@@ -658,16 +670,40 @@ export class LlmProbe {
     this.requestsRunning = Number.isFinite(running) ? running : busy ? 1 : 0;
     this.slotsActive = this.requestsRunning;
     this.slotsTotal = Number.isFinite(maxSlots) && maxSlots > 0 ? maxSlots : 1;
-    this.kvCacheUsage = null;
+    // TensorFold exposes real tiles in /health, so the ones it can satisfy are
+    // derived here instead of being cleared as if they were vLLM-only:
+    //   KV pool occupancy = (pool_tokens - pool_free_tokens) / pool_tokens
+    //   MTP acceptance    = accepted_total / drafted_total
+    //   prefix cache hit + cached/uncached prefill split via _setPrefillSplitRates
+    // Only tiles TensorFold has no source for stay null.
     this.requestsWaiting = null;
-    this.ttftP95Seconds = null;
     this.preemptionsTotal = null;
-    this.prefixCacheHitRate = null;
+    this.ttftP95Seconds = null;
     this.e2eP95Seconds = null;
     this.itlP95Seconds = null;
-    this.mtpAcceptanceRate = null;
-    this.cachedPrefillTps = null;
-    this.uncachedPrefillTps = null;
+
+    const poolTotal = Number(data?.pool_tokens);
+    const poolFree = Number(data?.pool_free_tokens);
+    this.kvCacheUsage =
+      Number.isFinite(poolTotal) && poolTotal > 0 && Number.isFinite(poolFree)
+        ? Math.round(((poolTotal - poolFree) / poolTotal) * 10000) / 10000
+        : null;
+
+    const acceptedDrafts = Number(data?.accepted_total);
+    const draftedTokens = Number(data?.drafted_total);
+    this.mtpAcceptanceRate =
+      Number.isFinite(draftedTokens) && draftedTokens > 0 && Number.isFinite(acceptedDrafts)
+        ? Math.round((acceptedDrafts / draftedTokens) * 10000) / 10000
+        : null;
+
+    const cachedPromptTokens = Number(data?.cached_tokens_total);
+    this._setPrefillSplitRates(
+      Number.isFinite(cachedPromptTokens) ? cachedPromptTokens : null,
+      Number.isFinite(prompt) && Number.isFinite(cachedPromptTokens)
+        ? Math.max(0, prompt - cachedPromptTokens)
+        : null,
+      dtSec
+    );
 
     if (!Number.isFinite(completion)) {
       this.generationTps = busy ? this.generationTps : 0;
@@ -711,8 +747,18 @@ export class LlmProbe {
         } else {
           this.prefillTps = 0;
         }
-      } else if (!busy && this.generationTps <= 0) {
-        this.prefillTps = 0;
+      } else {
+        // Legacy serve_openai.py /health carries neither prefill_seconds_total nor
+        // cached_tokens_total, so the engine-time rate above cannot be computed for
+        // it. Fall back to the wall-clock prompt-token delta, which is the only
+        // prefill signal that shape has. TensorFold always sends both fields, so
+        // its engine-time rate is untouched.
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        if (Number.isFinite(deltaIn) && deltaIn > 0) {
+          this.prefillTps = Math.round((deltaIn / dtSec) * 100) / 100;
+        } else if (!busy && this.generationTps <= 0) {
+          this.prefillTps = 0;
+        }
       }
     } else if (!busy) {
       this.generationTps = 0;
@@ -722,6 +768,25 @@ export class LlmProbe {
     if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
     this.lastTokenCounts.output = completion;
     this.totalOutputTokens = completion;
+  }
+
+  /**
+   * Apply TensorFold Prometheus /metrics tiles that /health does not carry.
+   * Histograms and the waiting queue only; counters and rates stay in
+   * _applyExl3Health so one poll never fights itself over lastTokenCounts.
+   * @param {string} txt
+   */
+  _applyTensorfoldMetrics(txt) {
+    const ttftHist = this._parsePromHistogram(txt, "tensorfold:time_to_first_token_seconds");
+    const ttftP95 = this._histogramQuantile(ttftHist.buckets, ttftHist.total, 0.95);
+    this.ttftP95Seconds = ttftP95 == null ? null : Math.round(ttftP95 * 1000) / 1000;
+
+    const e2eHist = this._parsePromHistogram(txt, "tensorfold:request_latency_seconds");
+    const e2eP95 = this._histogramQuantile(e2eHist.buckets, e2eHist.total, 0.95);
+    this.e2eP95Seconds = e2eP95 == null ? null : Math.round(e2eP95 * 1000) / 1000;
+
+    const waiting = this._getPromMetric(txt, "tensorfold:requests_waiting");
+    if (waiting != null) this.requestsWaiting = Math.round(waiting);
   }
 
   /**
@@ -1271,11 +1336,11 @@ export class LlmProbe {
   }
 
   /**
-   * Parse a vLLM Prometheus histogram from /metrics text.
+   * Parse a Prometheus histogram from /metrics text (any metric prefix).
    * Returns { buckets: [{upper, count}], total } with cumulative counts per `le`,
    * summed across label sets. `total` is the summed `_count` series (or null).
    */
-  _parseVllmHistogram(body, metricPrefix) {
+  _parsePromHistogram(body, metricPrefix) {
     const esc = metricPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     // Bucket lines: <metricPrefix>_bucket{...le="X"...} VALUE
     const bucketRe = new RegExp(
@@ -1294,7 +1359,7 @@ export class LlmProbe {
       if (upper === Infinity) infCount += count;
       byUpper.set(upper, (byUpper.get(upper) || 0) + count);
     }
-    const total = this._getVllmMetric(body, `${metricPrefix.replace(/^vllm:/, "")}_count`);
+    const total = this._getPromMetric(body, `${metricPrefix}_count`);
     // Prometheus invariant: +Inf bucket count == _count. Mismatch → refuse quantile.
     if (total != null && infCount > 0 && Math.abs(infCount - total) > 1e-6) {
       return { buckets: [], total: null };
@@ -1302,6 +1367,11 @@ export class LlmProbe {
     const buckets = Array.from(byUpper, ([upper, count]) => ({ upper, count }));
     buckets.sort((a, b) => a.upper - b.upper);
     return { buckets, total };
+  }
+
+  /** Back-compat alias: vLLM histogram prefixes parse the same way. */
+  _parseVllmHistogram(body, metricPrefix) {
+    return this._parsePromHistogram(body, metricPrefix);
   }
 
   /**
