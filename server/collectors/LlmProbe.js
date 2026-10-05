@@ -335,10 +335,21 @@ export class LlmProbe {
       if (/ds4/i.test(ownedBy)) return "ds4";
       if (/sglang/i.test(ownedBy)) return "sglang";
       if (/exl3/i.test(ownedBy)) return "exl3";
+      // TensorFold (GLM-5.3-Flash on 2x DGX Spark) reports owned_by "tensorfold" and
+      // serves the same /health token counters as exl3. Deciding it from /v1/models is
+      // deterministic, so the 60 s re-detect can no longer flip the backend to vllm --
+      // and blank tok/s -- when /health happens to be slow while the engine is busy.
+      if (/tensorfold/i.test(ownedBy)) return "exl3";
     }
     if (await this._probeIsDs4()) return "ds4";
     if (await this._probeIsSglang()) return "sglang";
-    if (await this._probeIsExl3()) return "exl3";
+    // vLLM でもモデルIDに "exl3" を含む配信 (例 DeepSeek-v4.1-Flash-EXL3) があるため、
+    // /health が EXL3 形式 (serve_openai.py: backend/busy + token totals) を返す場合に限る。
+    // Keep the last good probe: overwriting it with null on a single slow/failed fetch
+    // downgraded the backend to vllm and zeroed tok/s until the next re-detect.
+    const health = await this._fetchExl3Health();
+    if (health) this._exl3Health = health;
+    if (this._exl3Health) return "exl3";
     return "vllm";
   }
 
@@ -354,6 +365,21 @@ export class LlmProbe {
       return LlmProbe._healthLooksLikeExl3(data);
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * /health を取得し EXL3 serve_openai.py 形式なら返す (非該当・失敗なら null)。
+   * @returns {Promise<object|null>}
+   */
+  async _fetchExl3Health() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/health`);
+      if (!res.ok) return null;
+      const data = await res.json().catch(() => null);
+      return LlmProbe._healthLooksLikeExl3(data) ? data : null;
+    } catch {
+      return null;
     }
   }
 
@@ -450,21 +476,20 @@ export class LlmProbe {
     }
 
     // EXL3 serve_openai.py: live tok/s from /health cumulative counters (no Prometheus).
+    // Classification が EXL3 形式を確認済み。owned_by だけでは確定させない。
     if (this.backendType === "exl3" || this.backendType == null) {
-      try {
-        const healthRes = await this._fetch(`${this.baseUrl}/health`);
-        if (healthRes.ok) {
-          const health = await healthRes.json().catch(() => null);
-          if (LlmProbe._healthLooksLikeExl3(health)) {
-            this.backendType = "exl3";
-            this._applyExl3Health(health, dtSec);
-            return this._getSnapshot();
-          }
-        }
-      } catch {
-        /* health optional unless already classified exl3 */
+      // Fetch /health FRESH on every probe. Caching it here (`??`) meant the token
+      // counters were only re-read on a re-detect, so the delta-based tok/s stayed
+      // 0 and totalOutputTokens froze while a request was actually decoding.
+      // /health is a cheap JSON call; refresh it on the same cadence as /metrics.
+      const health = (await this._fetchExl3Health()) ?? this._exl3Health;
+      this._exl3Health = health;
+      if (health) {
+        this.backendType = "exl3";
+        this._applyExl3Health(health, dtSec);
+        return this._getSnapshot();
       }
-      if (this.backendType === "exl3") return this._getSnapshot();
+      if (this.backendType === "exl3") this.backendType = "vllm";
     }
 
     // SGLang: native info endpoints. Skip on known vLLM/ds4 to avoid 404 spam.
@@ -626,9 +651,13 @@ export class LlmProbe {
     const ctx = Number(data?.context_length);
     if (Number.isFinite(ctx) && ctx > 0) this.contextLength = Math.round(ctx);
 
-    this.requestsRunning = busy ? 1 : 0;
-    this.slotsActive = busy ? 1 : 0;
-    this.slotsTotal = 1;
+    // TensorFold's /health carries real slot info; the original serve_openai.py
+    // only had `busy`, so keep that as the fallback.
+    const running = Number(data?.requests_running);
+    const maxSlots = Number(data?.streams?.max);
+    this.requestsRunning = Number.isFinite(running) ? running : busy ? 1 : 0;
+    this.slotsActive = this.requestsRunning;
+    this.slotsTotal = Number.isFinite(maxSlots) && maxSlots > 0 ? maxSlots : 1;
     this.kvCacheUsage = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
@@ -649,9 +678,39 @@ export class LlmProbe {
     if (dtSec > 0 && dtSec < 10) {
       const deltaOut = completion - this.lastTokenCounts.output;
       this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-      if (Number.isFinite(prompt)) {
-        const deltaIn = prompt - this.lastTokenCounts.input;
-        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      // Live prefill rate. TensorFold adds a request's prompt tokens when its PREFILL
+      // FINISHES, so a 400k-token prompt lands as one +400k jump inside a single poll
+      // window. Dividing that by WALL time gave ~224k tok/s; dividing the lifetime
+      // cumulative totals gave a constant that never moved. Divide the token delta by
+      // the ENGINE'S OWN prefill-seconds delta instead -- that is the true throughput
+      // of the prefill that just completed (~1.6k tok/s cold, far higher when cached).
+      const prefillSeconds = Number(data?.prefill_seconds_total);
+      const cachedTokens = Number(data?.cached_tokens_total);
+      const prefillingNow = Number(data?.streams?.prefilling);
+      if (
+        Number.isFinite(prompt) &&
+        Number.isFinite(prefillSeconds) &&
+        Number.isFinite(cachedTokens)
+      ) {
+        const uncachedNow = Math.max(0, prompt - cachedTokens);
+        const prev = this._tfPrefill;
+        this._tfPrefill = { tokens: uncachedNow, seconds: prefillSeconds };
+        if (prev) {
+          const dTokens = uncachedNow - prev.tokens;
+          const dSeconds = prefillSeconds - prev.seconds;
+          if (dTokens > 0 && dSeconds > 0) {
+            this.prefillTps = Math.round((dTokens / dSeconds) * 100) / 100;
+            this._tfPrefillAt = Date.now();
+          } else if (
+            prefillingNow === 0 &&
+            (!this._tfPrefillAt || Date.now() - this._tfPrefillAt > 10000)
+          ) {
+            // Nothing prefilled for 10 s and nothing prefilling now: show idle.
+            this.prefillTps = 0;
+          }
+        } else {
+          this.prefillTps = 0;
+        }
       } else if (!busy && this.generationTps <= 0) {
         this.prefillTps = 0;
       }
