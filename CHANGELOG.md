@@ -9,6 +9,22 @@ Format: version sections are listed newest first.
 
 ## [Unreleased]
 
+### Added
+- **TensorFold inference tiles** — the `exl3` (TensorFold) path left KV cache, prefix-cache
+  hit rate, MTP acceptance, TTFT p95 and the cached/uncached prefill split blank as
+  "vLLM-histogram specific". TensorFold publishes all of them, so the tiles it can satisfy
+  are now derived from `/health` (`pool_tokens`/`pool_free_tokens`,
+  `cached_tokens_total`/`prompt_tokens_total`, `accepted_total`/`drafted_total`) and the
+  histograms it can only serve from Prometheus `/metrics` (TTFT, request latency, waiting
+  queue) are read best-effort. The histogram parser is prefix-agnostic now
+  (`_parsePromHistogram`), with `_parseVllmHistogram` kept as an alias.
+
+### Fixed
+- **Legacy EXL3 prefill rate** — after the TensorFold engine-time rework, `/health` shapes
+  without `prefill_seconds_total` (plain `serve_openai.py`) reported 0 prefill tok/s. They
+  fall back to the wall-clock prompt-token delta again; TensorFold, which always sends both
+  fields, is unaffected.
+
 ---
 
 ## [1.8.2] — 2026-08-23
